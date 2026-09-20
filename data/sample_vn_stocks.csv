@@ -1,0 +1,214 @@
+import argparse
+import math
+from dataclasses import dataclass
+from typing import List, Optional
+
+import numpy as np
+import pandas as pd
+
+
+@dataclass
+class StockScore:
+    ticker: str
+    score: float
+    trend_up: bool
+    macd_up: bool
+    rsi_ok: bool
+    volume_ok: bool
+    fib_ok: bool
+    support_ok: bool
+    decision: str
+    last_price: float
+
+
+def generate_demo_data() -> pd.DataFrame:
+    """Sinh dữ liệu demo để app chạy ngay mà không cần API bên ngoài."""
+    tickers = ["FPT", "VNM", "MWG", "VCB", "HPG", "MSN", "TCB", "GVR"]
+    rows = []
+    start_date = pd.Timestamp("2024-01-01")
+
+    for idx, ticker in enumerate(tickers):
+        base = 100 + idx * 15
+        price = base
+        for day in range(120):
+            date = start_date + pd.Timedelta(days=day)
+            drift = 0.9 + (day / 200) + (idx * 0.15)
+            change = np.sin(day / 7 + idx) * 1.8 + np.cos(day / 11 + idx) * 1.3
+            close = max(20, price + change * drift)
+            open_ = close * (1 + np.sin(day / 9 + idx) * 0.012)
+            high = max(open_, close) * (1 + 0.015 + abs(np.sin(day / 5 + idx)) * 0.025)
+            low = min(open_, close) * (1 - 0.015 - abs(np.cos(day / 6 + idx)) * 0.025)
+            volume = int(500000 + (day * 12000) + (idx * 70000) + abs(np.sin(day + idx)) * 300000)
+            rows.append(
+                {
+                    "date": date,
+                    "ticker": ticker,
+                    "open": round(float(open_), 2),
+                    "high": round(float(high), 2),
+                    "low": round(float(low), 2),
+                    "close": round(float(close), 2),
+                    "volume": volume,
+                }
+            )
+            price = close
+
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+def load_data(csv_path: Optional[str] = None) -> pd.DataFrame:
+    """Load dữ liệu từ CSV hoặc dùng demo data nếu không có file."""
+    if csv_path:
+        df = pd.read_csv(csv_path, parse_dates=["date"])
+        if "ticker" not in df.columns:
+            raise ValueError("CSV phải có cột 'ticker'.")
+        return df
+    return generate_demo_data()
+
+
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.sort_values(["ticker", "date"]).copy()
+    df["ema_20"] = df.groupby("ticker")["close"].transform(lambda s: s.ewm(span=20, adjust=False).mean())
+    df["ema_50"] = df.groupby("ticker")["close"].transform(lambda s: s.ewm(span=50, adjust=False).mean())
+    df["sma_20"] = df.groupby("ticker")["close"].transform(lambda s: s.rolling(20).mean())
+    df["sma_50"] = df.groupby("ticker")["close"].transform(lambda s: s.rolling(50).mean())
+    df["vol_20"] = df.groupby("ticker")["volume"].transform(lambda s: s.rolling(20).mean())
+
+    def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+        delta = series.diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.rolling(window=period, min_periods=period).mean()
+        avg_loss = loss.rolling(window=period, min_periods=period).mean()
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        rsi_val = 100 - (100 / (1 + rs))
+        return rsi_val
+
+    df["rsi_14"] = df.groupby("ticker")["close"].transform(rsi)
+
+    def macd_line(series: pd.Series) -> pd.Series:
+        ema12 = series.ewm(span=12, adjust=False).mean()
+        ema26 = series.ewm(span=26, adjust=False).mean()
+        return ema12 - ema26
+
+    macd = df.groupby("ticker")["close"].transform(macd_line)
+    signal = macd.groupby(df["ticker"]).transform(lambda s: s.ewm(span=9, adjust=False).mean())
+    df["macd"] = macd
+    df["macd_signal"] = signal
+    df["macd_histogram"] = df["macd"] - df["macd_signal"]
+    return df
+
+
+def fib_levels(high: float, low: float) -> dict:
+    span = high - low
+    return {
+        "0.382": high - span * 0.382,
+        "0.5": high - span * 0.5,
+        "0.618": high - span * 0.618,
+        "0.786": high - span * 0.786,
+    }
+
+
+def evaluate_stock(df: pd.DataFrame) -> Optional[StockScore]:
+    if df.empty:
+        return None
+
+    recent = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) > 1 else recent
+    close = float(recent["close"])
+    ema20 = float(recent["ema_20"])
+    ema50 = float(recent["ema_50"])
+    rsi = float(recent["rsi_14"])
+    vol = float(recent["volume"])
+    vol_avg = float(recent["vol_20"])
+    macd = float(recent["macd"])
+    signal = float(recent["macd_signal"])
+
+    trend_up = (close > ema20) and (ema20 > ema50) and (recent["close"] > prev["close"])
+    macd_up = macd > signal
+    rsi_ok = 50 <= rsi <= 70
+    volume_ok = vol > vol_avg * 1.1
+
+    swing_high = float(df["high"].max())
+    swing_low = float(df["low"].min())
+    levels = fib_levels(swing_high, swing_low)
+    fib_ok = any(levels[k] <= close <= levels[k] * 1.02 or levels[k] * 0.98 <= close <= levels[k] for k in levels)
+
+    support = float(df["low"].rolling(20, min_periods=5).min().iloc[-1])
+    resistance = float(df["high"].rolling(20, min_periods=5).max().iloc[-1])
+    support_ok = close >= support * 0.96
+
+    criteria = {
+        "trend_up": trend_up,
+        "macd_up": macd_up,
+        "rsi_ok": rsi_ok,
+        "volume_ok": volume_ok,
+        "fib_ok": fib_ok,
+        "support_ok": support_ok,
+    }
+
+    score = sum(1 for v in criteria.values() if v)
+    decision = "PASS" if score >= 5 else "WATCH"
+
+    return StockScore(
+        ticker=str(recent["ticker"]),
+        score=float(score),
+        trend_up=trend_up,
+        macd_up=macd_up,
+        rsi_ok=rsi_ok,
+        volume_ok=volume_ok,
+        fib_ok=fib_ok,
+        support_ok=support_ok,
+        decision=decision,
+        last_price=close,
+    )
+
+
+def screen_stocks(df: pd.DataFrame) -> List[StockScore]:
+    df = compute_indicators(df)
+    results = []
+    for ticker, group in df.groupby("ticker"):
+        result = evaluate_stock(group)
+        if result is not None:
+            results.append(result)
+    return sorted(results, key=lambda x: x.score, reverse=True)
+
+
+def print_results(results: List[StockScore]):
+    if not results:
+        print("Không có mã nào đạt tiêu chí lọc.")
+        return
+
+    print(f"{'ticker':<8} {'score':>5} {'trend':>6} {'macd':>6} {'rsi':>6} {'vol':>6} {'fib':>6} {'decision':>8}")
+    for item in results:
+        print(
+            f"{item.ticker:<8} "
+            f"{item.score:>5.1f} "
+            f"{str(item.trend_up):>6} "
+            f"{str(item.macd_up):>6} "
+            f"{str(item.rsi_ok):>6} "
+            f"{str(item.volume_ok):>6} "
+            f"{str(item.fib_ok):>6} "
+            f"{item.decision:>8}"
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Filter Vietnamese stocks using a simple trend + Fibonacci + volume screener.")
+    parser.add_argument("--csv", type=str, default=None, help="Đường dẫn file CSV chứa dữ liệu giá cổ phiếu.")
+    parser.add_argument("--demo", action="store_true", help="Dùng dữ liệu demo nếu không có file CSV.")
+    args = parser.parse_args()
+
+    if args.demo or not args.csv:
+        df = generate_demo_data()
+    else:
+        df = load_data(args.csv)
+
+    results = screen_stocks(df)
+    print_results(results)
+
+
+if __name__ == "__main__":
+    main()
+
